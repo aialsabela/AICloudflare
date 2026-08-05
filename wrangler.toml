@@ -10,7 +10,7 @@ binding = "AI"
 # مقدار id را بعد از ساخت namespace از داشبورد Cloudflare جایگزین کنید
 [[kv_namespaces]]
 binding = "CHAT_HISTORY"
-id = ""kv_namespaces": [{
+id = "kv_namespaces": [{
                     "binding": "KV_BINDING",
                     "id": "aeb67a394dac424bb510c1c239edfe66"
                  }]"
