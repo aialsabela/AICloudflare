@@ -10,7 +10,10 @@ binding = "AI"
 # مقدار id را بعد از ساخت namespace از داشبورد Cloudflare جایگزین کنید
 [[kv_namespaces]]
 binding = "CHAT_HISTORY"
-id = "PUT_YOUR_KV_NAMESPACE_ID_HERE"
+id = ""kv_namespaces": [{
+                    "binding": "KV_BINDING",
+                    "id": "aeb67a394dac424bb510c1c239edfe66"
+                 }]"
 
 # نکته: TELEGRAM_BOT_TOKEN و WEBHOOK_SECRET اطلاعات حساس هستند و
 # نباید داخل این فایل یا گیت‌هاب قرار بگیرند — این‌ها را از داشبورد Cloudflare
