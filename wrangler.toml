@@ -1,0 +1,17 @@
+name = "telegram-ai-bot"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+# اتصال رایگان به Cloudflare Workers AI
+[ai]
+binding = "AI"
+
+# اتصال به Workers KV برای ذخیره‌ی حافظه‌ی مکالمه (رایگان)
+# مقدار id را بعد از ساخت namespace از داشبورد Cloudflare جایگزین کنید
+[[kv_namespaces]]
+binding = "CHAT_HISTORY"
+id = "PUT_YOUR_KV_NAMESPACE_ID_HERE"
+
+# نکته: TELEGRAM_BOT_TOKEN و WEBHOOK_SECRET اطلاعات حساس هستند و
+# نباید داخل این فایل یا گیت‌هاب قرار بگیرند — این‌ها را از داشبورد Cloudflare
+# (Settings > Variables and Secrets) اضافه می‌کنید، نه اینجا. جزئیات در README.
