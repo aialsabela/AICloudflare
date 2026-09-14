@@ -15,7 +15,7 @@ const SYSTEM_PROMPT =
   "تو یک دستیار هوشمند و مفید هستی که به فارسی و به‌طور خلاصه و روشن جواب می‌دهی.";
 
 // مدل رایگان متن‌باز روی Cloudflare Workers AI
-const MODEL = "@cf/meta/llama-3.1-8b-instruct";
+const MODEL = "@cf/qwen/qwen3.8-27b";
 
 export default {
   async fetch(request, env, ctx) {
