@@ -167,10 +167,23 @@ async function replySmart(env, chatId, rawText) {
 }
 __name(replySmart, "replySmart");
 
-// تابع جستجوی زنده در وب با Tavily API
+// fetch با سقف زمانی مشخص — اگر سرور طرف مقابل تا timeoutMs جواب ندهد، درخواست لغو می‌شود
+// (به‌جای این‌که کل پردازش آپدیت، بی‌نهایت روی یک fetch بیرونی معلق بماند)
+async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+__name(fetchWithTimeout, "fetchWithTimeout");
+
+// تابع جستجوی زنده در وب با Tavily API (با سقف زمانی ۸ ثانیه)
 async function searchWeb(query, apiKey) {
   try {
-    const response = await fetch("https://api.tavily.com/search", {
+    const response = await fetchWithTimeout("https://api.tavily.com/search", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -180,13 +193,16 @@ async function searchWeb(query, apiKey) {
         include_answer: false,
         max_results: 3
       })
-    });
+    }, 8000);
     const data = await response.json();
     if (data.results && data.results.length > 0) {
       return data.results.map(r => `عنوان: ${r.title}\nمنبع: ${r.url}\nخلاصه: ${r.content}`).join("\n\n");
     }
     return "نتیجه‌ای در وب یافت نشد.";
   } catch (err) {
+    if (err.name === "AbortError") {
+      return "جستجوی وب بیش از حد طول کشید (timeout) و نادیده گرفته شد.";
+    }
     return `خطا در جستجوی وب: ${err.message}`;
   }
 }
@@ -257,7 +273,7 @@ async function getNeuronUsage(env) {
   `;
 
   try {
-    const res = await fetch("https://api.cloudflare.com/client/v4/graphql", {
+    const res = await fetchWithTimeout("https://api.cloudflare.com/client/v4/graphql", {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${env.CF_API_TOKEN}`,
@@ -267,7 +283,7 @@ async function getNeuronUsage(env) {
         query,
         variables: { accountTag: env.CF_ACCOUNT_ID, today: todayUtc }
       })
-    });
+    }, 6000);
     const data = await res.json();
     if (!res.ok || data?.errors) {
       return { ok: false, raw: data };
@@ -276,6 +292,9 @@ async function getNeuronUsage(env) {
     const consumed = groups.reduce((sum, g) => sum + (g?.sum?.totalNeurons || 0), 0);
     return { ok: true, consumed, date: todayUtc };
   } catch (err) {
+    if (err.name === "AbortError") {
+      return { ok: false, error: "درخواست وضعیت مصرف بیش از حد طول کشید (timeout)." };
+    }
     return { ok: false, error: err.message };
   }
 }
@@ -367,7 +386,7 @@ __name(downloadTelegramFile, "downloadTelegramFile");
 const PDF_MAX_BYTES = 15 * 1024 * 1024; // حداکثر حجم فایل PDF (تلگرام خودش برای ربات‌ها سقف ۲۰ مگابایت دارد)
 
 // 📎 تنظیمات مشترک فایل‌های متنی و PDF
-const DOC_MAX_CHARS = 25000;            // حداکثر تعداد کاراکتر از محتوای فایل که به مدل داده می‌شود
+const DOC_MAX_CHARS = 50000;            // حداکثر تعداد کاراکتر از محتوای فایل که به مدل داده می‌شود
 const DOC_TTL_SECONDS = 6 * 60 * 60;    // فایل آخر کاربر تا ۶ ساعت (یا تا /new) برای سؤال‌های بعدی نگه داشته می‌شود
 
 // کوتاه کردن محتوای فایل در صورت طولانی بودن
@@ -589,15 +608,40 @@ export default {
       }
     }
 
-    let chatId = null;
+    let update;
     try {
-      const update = await request.json();
+      update = await request.json();
+    } catch (parseErr) {
+      return new Response("Bad Request", { status: 400 });
+    }
 
-      // ♻️ تلگرام اگر جواب را دیر بگیرد همان آپدیت را دوباره می‌فرستد؛ تکراری‌ها نادیده گرفته می‌شوند
-      if (isDuplicateUpdate(update?.update_id)) {
-        return new Response("OK", { status: 200 });
-      }
+    // ♻️ تلگرام اگر جواب را دیر بگیرد همان آپدیت را دوباره می‌فرستد؛ تکراری‌ها نادیده گرفته می‌شوند
+    if (isDuplicateUpdate(update?.update_id)) {
+      return new Response("OK", { status: 200 });
+    }
 
+    // 🚀 نکتهٔ کلیدی برای پایداری روی Cloudflare Workers: تلگرام برای هر آپدیت حدود ۶۰ ثانیه منتظر
+    // جواب HTTP می‌مونه؛ اگه دیرتر جواب بگیره ارتباط رو قطع می‌کنه (دقیقاً همون چیزی که توی لاگ‌های
+    // Worker به‌صورت outcome:"canceled" و wallTimeMs نزدیک به ۶۰۰۰۰ دیده می‌شه) و همون آپدیت رو
+    // دوباره ارسال می‌کنه. برای همین این‌جا فوراً «OK» برمی‌گردونیم و کل کار واقعی (فراخوانی مدل
+    // هوش مصنوعی، دانلود فایل، سرچ وب و ...) رو با ctx.waitUntil در پس‌زمینه ادامه می‌دیم — این
+    // پس‌زمینه دیگه به جواب HTTP وابسته نیست و محدودیت ۶۰ ثانیه‌ای وبهوک تلگرام روش تأثیری نداره.
+    ctx.waitUntil(
+      handleUpdate(env, update).catch((err) => {
+        console.error("خطای پردازش آپدیت:", err);
+      })
+    );
+
+    return new Response("OK", { status: 200 });
+  }
+};
+
+// 🧠 کل منطق واقعی پردازش یک آپدیت تلگرام. چون این تابع در پس‌زمینه (ctx.waitUntil) اجرا می‌شود و
+// دیگر هیچ پاسخ HTTP منتظرش نیست، دیگر لازم نیست چیزی return شود؛ فقط برای خروج زودهنگام از
+// `return;` (بدون مقدار) استفاده شده — قبلاً همین نقطه‌ها `return new Response("OK", ...)` بودند.
+async function handleUpdate(env, update) {
+  let chatId = null;
+  try {
       // 🔒 بررسی مجاز بودن کاربر — قبل از هر پردازش دیگری
       const incomingUserId = update?.message?.from?.id ?? update?.callback_query?.from?.id ?? null;
       if (!isAuthorized(env, incomingUserId)) {
@@ -613,17 +657,17 @@ export default {
             text: "⛔ این ربات خصوصی است و فقط برای کاربران مجاز در دسترس است."
           });
         }
-        return new Response("OK", { status: 200 });
+        return;
       }
 
       // 🔘 فشردن یکی از دکمه‌های شیشه‌ای (مثلاً انتخاب مدل)
       if (update?.callback_query) {
         await handleCallbackQuery(env, update.callback_query);
-        return new Response("OK", { status: 200 });
+        return;
       }
 
       if (!update?.message) {
-        return new Response("OK", { status: 200 });
+        return;
       }
 
       chatId = update.message.chat.id;
@@ -650,7 +694,7 @@ export default {
             parse_mode: "HTML"
           });
         }
-        return new Response("OK", { status: 200 });
+        return;
       }
 
       // 📄 فایل متنی/کد (txt, html, js, css, json, py, md و ...): محتوا خونده می‌شه
@@ -682,7 +726,7 @@ export default {
           chat_id: chatId,
           text: "📎 این فرمت فایل پشتیبانی نمی‌شه. فایل PDF و فایل‌های متنی/کد (مثل txt, html, js, css, json, py, md) رو می‌تونی بفرستی؛ فایل‌های باینری مثل Word/Excel فعلاً پشتیبانی نمی‌شن."
         });
-        return new Response("OK", { status: 200 });
+        return;
       }
       if (isTextFile) {
         await sendTelegram(env.BOT_TOKEN, "sendChatAction", { chat_id: chatId, action: "typing" });
@@ -705,7 +749,7 @@ export default {
             text: `🚨 خواندن فایل ناموفق بود:\n<pre><code>${escapeHtml(docErr.message)}</code></pre>`,
             parse_mode: "HTML"
           });
-          return new Response("OK", { status: 200 });
+          return;
         }
       } else if (isPdf) {
         // 📄 فایل PDF: متن داخلش استخراج می‌شه و مثل یک پیام متنی وارد پایپ‌لاین اصلی می‌شه
@@ -716,7 +760,7 @@ export default {
               chat_id: chatId,
               text: `📄 حجم این PDF بیشتر از ${PDF_MAX_BYTES / (1024 * 1024)} مگابایته و نمی‌تونم بخونمش. یه فایل کم‌حجم‌تر یا چند صفحهٔ اولش رو بفرست.`
             });
-            return new Response("OK", { status: 200 });
+            return;
           }
 
           const pdfBuffer = await downloadTelegramFile(env, doc.file_id);
@@ -727,7 +771,7 @@ export default {
               chat_id: chatId,
               text: "📄 هیچ متنی داخل این PDF پیدا نکردم. احتمالاً اسکن‌شده یا عکسیه (متن قابل انتخاب نداره). اگه صفحه‌ها رو به‌صورت عکس بفرستی، می‌تونم با تحلیل تصویر بررسی‌شون کنم."
             });
-            return new Response("OK", { status: 200 });
+            return;
           }
 
           const clippedPdf = clipDoc(pdfContent);
@@ -748,7 +792,7 @@ export default {
             text: `🚨 خواندن PDF ناموفق بود:\n<pre><code>${escapeHtml(pdfErr.message)}</code></pre>`,
             parse_mode: "HTML"
           });
-          return new Response("OK", { status: 200 });
+          return;
         }
       } else if (update.message.voice || update.message.audio) {
         const voiceObj = update.message.voice || update.message.audio;
@@ -761,7 +805,7 @@ export default {
             text: `🚨 تشخیص گفتار ناموفق بود:\n<pre><code>${escapeHtml(voiceErr.message)}</code></pre>`,
             parse_mode: "HTML"
           });
-          return new Response("OK", { status: 200 });
+          return;
         }
 
         if (!text) {
@@ -769,7 +813,7 @@ export default {
             chat_id: chatId,
             text: "🎙 متوجه نشدم چی گفتی؛ صدا واضح نبود یا حرفی توش شناسایی نشد."
           });
-          return new Response("OK", { status: 200 });
+          return;
         }
 
         // نمایش متن شناسایی‌شده به کاربر برای شفافیت (و قابل کپی بودن)
@@ -782,7 +826,7 @@ export default {
         text = update.message.text.trim();
       } else {
         // نوع پیام پشتیبانی‌نشده (عکس، استیکر و ...)
-        return new Response("OK", { status: 200 });
+        return;
       }
 
       // 🆕 شروع مکالمهٔ جدید: تاریخچهٔ چت این کاربر از KV پاک می‌شه تا مدل دیگه موضوع قبلی رو ادامه نده
@@ -795,7 +839,7 @@ export default {
           chat_id: chatId,
           text: "🆕 مکالمهٔ جدید شروع شد؛ حافظهٔ گفتگوی قبلی پاک شد."
         });
-        return new Response("OK", { status: 200 });
+        return;
       }
 
       // 🧭 تأیید یک‌بارهٔ لایسنس مدل Vision (لازم قبل از اولین استفاده از تحلیل عکس)
@@ -814,7 +858,7 @@ export default {
             parse_mode: "HTML"
           });
         }
-        return new Response("OK", { status: 200 });
+        return;
       }
 
       // 🧭 دستور نمایش/تغییر مدل
@@ -828,7 +872,7 @@ export default {
           parse_mode: "HTML",
           reply_markup: buildModelKeyboard(currentKey)
         });
-        return new Response("OK", { status: 200 });
+        return;
       }
 
       // 🧭 دستور شروع
@@ -843,7 +887,7 @@ export default {
 \n\n${neuronText}\n\nمدل فعلی: <b>${escapeHtml(MODELS[currentKey].label)}</b>\n\nهر سوالی داری بپرس. برای تغییر مدل، دستور /model رو بفرست. برای فعال‌سازی تحلیل تصویر (فقط یک‌بار لازمه)، دستور /agreevision  دو بار رو بفرست. برای شروع یه مکالمهٔ تازه (پاک کردن حافظهٔ گفتگوی قبلی)، دستور /new رو بفرست.`,
           parse_mode: "HTML"
         });
-        return new Response("OK", { status: 200 });
+        return;
       }
 
       // ارسال وضعیت typing به تلگرام
@@ -860,7 +904,7 @@ export default {
             chat_id: chatId,
             text: "📎 برای خوندن فایل باید یکی از مدل‌های چت رو انتخاب کنی. دستور /model رو بفرست و مدل چت رو انتخاب کن، بعد فایل رو دوباره بفرست."
           });
-          return new Response("OK", { status: 200 });
+          return;
         }
         await sendTelegram(env.BOT_TOKEN, "sendChatAction", { chat_id: chatId, action: "upload_photo" });
         try {
@@ -879,7 +923,7 @@ export default {
             parse_mode: "HTML"
           });
         }
-        return new Response("OK", { status: 200 });
+        return;
       }
 
       // 🕒 محاسبه دقیق‌ترین ساعت و تاریخ زنده به وقت تهران (برای حل مشکل قفل زمانی کلاودفلر)
@@ -980,7 +1024,7 @@ ${docBlock}
           text: `🚨 مدل «${escapeHtml(MODELS[modelKey].label)}» (<code>${escapeHtml(MODEL_ID)}</code>) در دسترس نیست یا خطا داد:\n<pre><code>${escapeHtml(aiErr.message)}</code></pre>\n\nبا /model یه مدل دیگه انتخاب کن.`,
           parse_mode: "HTML"
         });
-        return new Response("OK", { status: 200 });
+        return;
       }
 
       // پشتیبانی از فرمت‌های مختلف خروجی مدل‌ها (دقیقاً مطابق منطق تستر مرورگر)
@@ -1031,9 +1075,8 @@ ${docBlock}
         });
       }
 
-      return new Response("OK", { status: 200 });
-
-    } catch (error) {
+      return;
+  } catch (error) {
       if (chatId) {
         await sendTelegram(env.BOT_TOKEN, "sendMessage", {
           chat_id: chatId,
@@ -1041,7 +1084,5 @@ ${docBlock}
           parse_mode: "HTML"
         });
       }
-      return new Response("OK", { status: 200 });
-    }
   }
-};
+}
