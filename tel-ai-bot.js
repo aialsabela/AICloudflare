@@ -385,6 +385,13 @@ __name(downloadTelegramFile, "downloadTelegramFile");
 // 📄 تنظیمات خواندن PDF
 const PDF_MAX_BYTES = 15 * 1024 * 1024; // حداکثر حجم فایل PDF (تلگرام خودش برای ربات‌ها سقف ۲۰ مگابایت دارد)
 
+// 🎙 تنظیمات صوت — نکتهٔ مهم: مشکل معمولاً حجم فایل نیست، مدت‌زمانشه.
+// یه فایل کم‌حجم با بیت‌ریت پایین (مثلاً ۳۲kbps) می‌تونه چندین ده دقیقه صدا باشه،
+// و Whisper در یک درخواست تک برای صداهای خیلی طولانی معمولاً خیلی طول می‌کشه یا گیر می‌کنه.
+// تلگرام خودش duration (ثانیه) رو برای voice/audio می‌فرسته، پس نیازی به باز کردن فایل نیست.
+const VOICE_MAX_DURATION_SECONDS = 10 * 60; // ۱۰ دقیقه — سقف امن برای یک درخواست Whisper
+const VOICE_MAX_BYTES = 20 * 1024 * 1024;   // سقف حجمی تلگرام برای دانلود فایل توسط ربات‌ها
+
 // 📎 تنظیمات مشترک فایل‌های متنی و PDF
 const DOC_MAX_CHARS = 50000;            // حداکثر تعداد کاراکتر از محتوای فایل که به مدل داده می‌شود
 const DOC_TTL_SECONDS = 6 * 60 * 60;    // فایل آخر کاربر تا ۶ ساعت (یا تا /new) برای سؤال‌های بعدی نگه داشته می‌شود
@@ -796,6 +803,24 @@ async function handleUpdate(env, update) {
         }
       } else if (update.message.voice || update.message.audio) {
         const voiceObj = update.message.voice || update.message.audio;
+
+        if (voiceObj.duration && voiceObj.duration > VOICE_MAX_DURATION_SECONDS) {
+          const maxMin = Math.round(VOICE_MAX_DURATION_SECONDS / 60);
+          const gotMin = Math.round(voiceObj.duration / 60);
+          await sendTelegram(env.BOT_TOKEN, "sendMessage", {
+            chat_id: chatId,
+            text: `🎙 این فایل صوتی حدود ${gotMin} دقیقه‌ست و بیشتر از سقف ${maxMin} دقیقه‌ست. فعلاً نمی‌تونم صداهای این‌قدر طولانی رو یک‌جا تبدیل کنم؛ لطفاً کوتاه‌ترش کن یا به چند بخش تقسیمش کن.`
+          });
+          return;
+        }
+        if (voiceObj.file_size && voiceObj.file_size > VOICE_MAX_BYTES) {
+          await sendTelegram(env.BOT_TOKEN, "sendMessage", {
+            chat_id: chatId,
+            text: `🎙 حجم این فایل صوتی بیشتر از ${VOICE_MAX_BYTES / (1024 * 1024)} مگابایته و نمی‌تونم دانلودش کنم.`
+          });
+          return;
+        }
+
         await sendTelegram(env.BOT_TOKEN, "sendChatAction", { chat_id: chatId, action: "typing" });
         try {
           text = await transcribeVoice(env, voiceObj.file_id);
